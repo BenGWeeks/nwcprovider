@@ -1,0 +1,17 @@
+{
+  "featured": [],
+  "extensions": [
+    {
+      "id": "nwcprovider",
+      "repo": "https://github.com/BenGWeeks/nwcprovider",
+      "name": "NWC Service Provider",
+      "version": "1.1.0+wf1",
+      "min_lnbits_version": "1.4.0",
+      "short_description": "Weeks-family patched build of NWC Service Provider - offloads bolt11_decode to a worker thread (#37) and breaks _process_invoice on .failed with a 300s deadline (#40) so the asyncio loop is no longer starved.",
+      "icon": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/weeks-family/static/image/nwcprovider.png",
+      "details_link": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/weeks-family/config.json",
+      "archive": "https://github.com/BenGWeeks/nwcprovider/archive/refs/tags/v1.1.0-wf1.zip",
+      "hash": "c14d9b4c4599050d62eccedb18e0fc9313b16545f30b942d9675fbb9139661bb"
+    }
+  ]
+}
