@@ -5,13 +5,13 @@
       "id": "nwcprovider",
       "repo": "https://github.com/BenGWeeks/nwcprovider",
       "name": "NWC Service Provider (Weeks)",
-      "version": "1.1.0+wf1",
+      "version": "1.1.1+wf1",
       "min_lnbits_version": "1.4.0",
       "short_description": "Weeks-family build — break _process_invoice loop on .failed payments (#40), offload bolt11_decode (#37).",
       "icon": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/weeks-family/static/image/nwcprovider.png",
       "details_link": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/weeks-family/config.json",
-      "archive": "https://github.com/BenGWeeks/nwcprovider/archive/refs/tags/v1.1.0-wf1.zip",
-      "hash": "c14d9b4c4599050d62eccedb18e0fc9313b16545f30b942d9675fbb9139661bb"
+      "archive": "https://github.com/BenGWeeks/nwcprovider/archive/refs/tags/v1.1.1-wf1.zip",
+      "hash": "7454411607c7b1f5477210ae8cc88a7c0eee4c9e9c6920dab94a323fbfb3a284"
     }
   ]
 }
