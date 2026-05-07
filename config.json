@@ -1,8 +1,8 @@
 {
-  "name": "NWC Service Provider",
+  "name": "NWC Service Provider (Weeks)",
   "short_description": "A NWC service provider for LNbits",
   "tile": "/nwcprovider/static/image/nwcprovider.png",
-  "version": "1.1.1+wf1",
+  "version": "1.1.1+wf2",
   "min_lnbits_version": "1.4.0",
   "contributors": [
     {
