@@ -63,7 +63,7 @@ and restores the extension from it when the container is recreated.
 ### Soak-test plan for PR #30 (before endorsing it upstream)
 
 We run #30 in production here, but we don't endorse it upstream until every item below has passed.
-Tracking issue: see the "Soak-test PR #30" issue on this repo.
+Tracking issue: [#1](https://github.com/BenGWeeks/nwcprovider/issues/1).
 
 - [ ] **Real usage**: at least 7 days on both `lnbits-family` and `lnbits-business`, with no notification-related errors in the logs and no regressions reported by connected apps.
 - [ ] **Multiple connections per wallet**: 2 or more connections on one wallet, some with and some without `notifications`. Only the permitted ones receive events, and each receives exactly one event per payment.
