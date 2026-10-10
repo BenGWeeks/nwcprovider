@@ -163,13 +163,18 @@ async def test_process_invoice_settling_on_final_poll_at_deadline_succeeds(
 
 
 @pytest.mark.asyncio
-async def test_wait_for_payment_bounds_a_hanging_status_call(monkeypatch):
+async def test_wait_for_payment_bounds_and_cancels_a_hanging_status_call(
+    monkeypatch,
+):
     monkeypatch.setattr(tasks, "PAYMENT_STATUS_POLL_DEADLINE_SECONDS", 0.05)
-    release = asyncio.Event()
+    cancelled = asyncio.Event()
 
     async def hanging_check_transaction_status(wallet_id: str, payment_hash: str):
-        await release.wait()
-        return SimpleNamespace(success=True, failed=False)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
     monkeypatch.setattr(
         tasks, "check_transaction_status", hanging_check_transaction_status
@@ -182,8 +187,8 @@ async def test_wait_for_payment_bounds_a_hanging_status_call(monkeypatch):
     assert status is None
     assert error is not None
     assert error["code"] == "OTHER"
-    release.set()  # let the shielded status check finish cleanly
-    await asyncio.sleep(0)
+    # The status query is cancelled, not left running in the background.
+    assert cancelled.is_set()
 
 
 def _payment(**kw):
@@ -203,6 +208,7 @@ def _payment(**kw):
         "extra": {},
         "expiry": None,
         "wallet_id": "wallet123",
+        "amount": -21000,
     }
     base.update(kw)
     from datetime import datetime, timezone
@@ -290,3 +296,79 @@ async def test_invoice_listener_ignores_unsettled_or_outgoing(monkeypatch):
     await tasks._on_invoice_paid(None, _payment(is_in=True, is_out=False))
     await tasks._on_invoice_paid(None, _payment(success=True, pending=False))
     assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_payment_sent_overlay_includes_lnbits_service_fee(
+    monkeypatch, fake_bolt11
+):
+    import importlib
+
+    lnbits_payments = importlib.import_module("lnbits.core.services.payments")
+
+    async def fake_get_wallet_payment(wallet_id, payment_hash):
+        return _payment()
+
+    sent = []
+
+    async def fake_send(sp, wallet_id, notification_type, notification, **kw):
+        sent.append(notification)
+
+    monkeypatch.setattr(tasks, "get_wallet_payment", fake_get_wallet_payment)
+    monkeypatch.setattr(tasks, "_send_notification_to_wallet", fake_send)
+    monkeypatch.setattr(
+        lnbits_payments, "service_fee", lambda amount, internal=False: -210
+    )
+
+    await tasks._notify_payment_sent(
+        None, "wallet123", "b" * 64, {"payment_hash": "a" * 64, "fee_msats": 10}
+    )
+
+    assert sent[0]["fees_paid"] == 220
+
+
+@pytest.mark.asyncio
+async def test_notification_send_is_bounded_when_relay_stalls(monkeypatch):
+    monkeypatch.setattr(tasks, "NOTIFICATION_SEND_TIMEOUT_SECONDS", 0.01)
+
+    async def fake_get_wallet_nwcs(_):
+        return [
+            SimpleNamespace(
+                pubkey="c" * 64, get_permissions=lambda: ["info", "notifications"]
+            )
+        ]
+
+    class StalledProvider:
+        async def send_notification(self, *a):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(tasks, "get_wallet_nwcs", fake_get_wallet_nwcs)
+
+    await asyncio.wait_for(
+        tasks._send_notification_to_wallet(
+            StalledProvider(), "wallet123", "payment_received", {}
+        ),
+        timeout=2,
+    )
+
+
+def test_notification_listener_is_owned_and_removed(monkeypatch):
+    calls = []
+
+    class FakeTaskManager:
+        def register_invoice_listener(self, func, name=None):
+            calls.append(("register", name))
+            return "listener-task"
+
+        def cancel_task(self, task):
+            calls.append(("cancel", task))
+
+    monkeypatch.setattr(tasks, "task_manager", FakeTaskManager())
+
+    listener = tasks._start_notification_listener(None)
+    tasks._stop_notification_listener(listener)
+
+    assert calls == [
+        ("register", "ext_nwcprovider_notifications"),
+        ("cancel", "listener-task"),
+    ]

@@ -15,6 +15,11 @@ from lnbits.db import Filters
 from lnbits.exceptions import PaymentError
 from lnbits.settings import settings
 from lnbits.tasks import register_invoice_listener
+
+try:
+    from lnbits.task_manager import task_manager
+except ImportError:  # older LNbits: fall back to the queue-based listener
+    task_manager = None  # type: ignore[assignment]
 from lnbits.wallets.base import PaymentStatus
 from loguru import logger
 
@@ -42,6 +47,9 @@ PAYMENT_STATUS_POLL_BACKOFF_MULTIPLIER = 2.0
 # neither settled nor failed (e.g. a stuck HTLC). Without it the request task
 # lives forever. Most NWC clients give up long before this anyway.
 PAYMENT_STATUS_POLL_DEADLINE_SECONDS = 300.0
+# Notifications are best-effort: never let a stalled relay hold up the pay
+# response or the notification worker for longer than this per event.
+NOTIFICATION_SEND_TIMEOUT_SECONDS = 10.0
 
 
 async def _check(nwc: NWCKey | None, method: str) -> dict | None:
@@ -139,8 +147,16 @@ async def _send_notification_to_wallet(
             if "notifications" not in permissions:
                 continue
             try:
-                await sp.send_notification(
-                    nwc_key.pubkey, notification_type, notification
+                await asyncio.wait_for(
+                    sp.send_notification(
+                        nwc_key.pubkey, notification_type, notification
+                    ),
+                    timeout=NOTIFICATION_SEND_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"nwcprovider: dropped {notification_type} notification to "
+                    f"{nwc_key.pubkey[:8]}... (relay not reachable)"
                 )
             except Exception as e:
                 logger.debug(
@@ -163,8 +179,9 @@ async def _wait_for_payment(
     deadline = time.monotonic() + PAYMENT_STATUS_POLL_DEADLINE_SECONDS
     while True:  # NIP-47 currently requires waiting for the preimage
         try:
+            # Read-only status query: safe to cancel when the deadline hits.
             payment_status = await asyncio.wait_for(
-                asyncio.shield(check_transaction_status(wallet_id, payment_hash)),
+                check_transaction_status(wallet_id, payment_hash),
                 timeout=max(deadline - time.monotonic(), 0.001),
             )
         except asyncio.TimeoutError:
@@ -299,6 +316,20 @@ async def _on_pay_invoice(
     return [(out, None, [])]
 
 
+def _settled_fee_msat(payment: Payment, routing_fee_msat: int | None) -> int:
+    """
+    Fee LNbits records when it settles an external payment: the routing fee
+    plus its own service fee (mirrors lnbits.core.services.payments).
+    """
+    try:
+        from lnbits.core.services.payments import service_fee
+
+        lnbits_fee = abs(service_fee(payment.amount, internal=False))
+    except Exception:
+        lnbits_fee = 0
+    return abs(int(routing_fee_msat or 0)) + lnbits_fee
+
+
 async def _notify_payment_sent(
     sp: NWCServiceProvider,
     wallet_id: str,
@@ -321,7 +352,7 @@ async def _notify_payment_sent(
                     notification.update(
                         state="settled",
                         preimage=res.get("preimage"),
-                        fees_paid=abs(int(res.get("fee_msats") or 0)),
+                        fees_paid=_settled_fee_msat(payment, res.get("fee_msats")),
                         settled_at=int(time.time()),
                     )
                 await _send_notification_to_wallet(
@@ -645,12 +676,41 @@ async def _on_invoice_paid(sp: NWCServiceProvider, payment: Payment):
 
 
 async def _notification_listener(sp: NWCServiceProvider):
-    """Listen for incoming paid invoices and send payment_received notifications."""
+    """
+    Legacy (pre-task_manager LNbits) listener for incoming paid invoices.
+    """
     queue: asyncio.Queue = asyncio.Queue()
     register_invoice_listener(queue, "ext_nwcprovider")
     while True:
         payment = await queue.get()
         await _on_invoice_paid(sp, payment)
+
+
+def _start_notification_listener(sp: NWCServiceProvider) -> Any:
+    """
+    Subscribe to incoming payments for payment_received notifications. With
+    task_manager the listener is an owned task that _stop_notification_listener
+    removes, so LNbits stops queueing payments for it when we stop.
+    """
+    if task_manager is None:
+        return asyncio.create_task(_notification_listener(sp))
+
+    async def on_paid(payment: Payment) -> None:
+        await _on_invoice_paid(sp, payment)
+
+    return task_manager.register_invoice_listener(
+        on_paid, name="ext_nwcprovider_notifications"
+    )
+
+
+def _stop_notification_listener(listener: Any) -> None:
+    try:
+        if isinstance(listener, asyncio.Task):
+            listener.cancel()
+        elif task_manager is not None:
+            task_manager.cancel_task(listener)
+    except Exception as e:  # already removed / shutting down
+        logger.debug(f"nwcprovider: stopping notification listener: {e}")
 
 
 async def handle_nwc():
@@ -670,14 +730,17 @@ async def handle_nwc():
     # nwcsp.addRequestListener("multi_pay_keysend", _on_multi_pay_keysend)
     ###
     await nwcsp.start()
-    notification_task = asyncio.create_task(_notification_listener(nwcsp))
+    listener = _start_notification_listener(nwcsp)
     try:
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:
-        notification_task.cancel()
         await nwcsp.cleanup()
         raise
+    finally:
+        # Always unsubscribe, also if this task dies and is restarted, so we
+        # never leave an orphaned listener (or a duplicate one) behind.
+        _stop_notification_listener(listener)
 
 
 async def handle_execution_queue():
