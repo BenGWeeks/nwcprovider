@@ -38,6 +38,10 @@ from .permission import nwc_permissions
 PAYMENT_STATUS_POLL_INITIAL_INTERVAL_SECONDS = 1.0
 PAYMENT_STATUS_POLL_MAX_INTERVAL_SECONDS = 60.0
 PAYMENT_STATUS_POLL_BACKOFF_MULTIPLIER = 2.0
+# Hard cap on how long a single pay request keeps polling a payment that is
+# neither settled nor failed (e.g. a stuck HTLC). Without it the request task
+# lives forever. Most NWC clients give up long before this anyway.
+PAYMENT_STATUS_POLL_DEADLINE_SECONDS = 300.0
 
 
 async def _check(nwc: NWCKey | None, method: str) -> dict | None:
@@ -142,6 +146,45 @@ async def _send_notification_to_wallet(
         logger.debug(f"Failed to send notifications for wallet {wallet_id}: {e}")
 
 
+async def _wait_for_payment(
+    wallet_id: str, payment_hash: str
+) -> tuple[PaymentStatus | None, dict | None]:
+    """
+    Poll an outgoing payment (with back-off) until it settles, fails, or the
+    deadline passes. Returns (status, None) on success or (None, error).
+    """
+    payment_status: PaymentStatus | None = None
+    poll_interval = PAYMENT_STATUS_POLL_INITIAL_INTERVAL_SECONDS
+    deadline = time.monotonic() + PAYMENT_STATUS_POLL_DEADLINE_SECONDS
+    while True:  # NIP-47 currently requires waiting for the preimage
+        payment_status = await check_transaction_status(wallet_id, payment_hash)
+        if payment_status and payment_status.success:
+            return payment_status, None
+        if payment_status.failed:
+            return None, {"code": "PAYMENT_FAILED", "message": "Payment failed."}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Still pending: report an error rather than falling through to
+            # the success path (which would hand back a zero preimage). The
+            # payment may still settle later; lookup_invoice reports it.
+            logger.warning(
+                f"nwcprovider: payment {payment_hash} still pending after "
+                f"{PAYMENT_STATUS_POLL_DEADLINE_SECONDS:.0f}s, giving up waiting"
+            )
+            return None, {
+                "code": "OTHER",
+                "message": (
+                    "Payment is still pending. It may still complete; "
+                    "check its status with lookup_invoice."
+                ),
+            }
+        await asyncio.sleep(min(poll_interval, remaining))
+        poll_interval = min(
+            poll_interval * PAYMENT_STATUS_POLL_BACKOFF_MULTIPLIER,
+            PAYMENT_STATUS_POLL_MAX_INTERVAL_SECONDS,
+        )
+
+
 async def _process_invoice(
     wallet_id: str,
     pubkey: str,
@@ -189,28 +232,9 @@ async def _process_invoice(
             raise e
     if not payment_hash:
         raise Exception("Payment hash not found")
-    wait_for_preimage = (
-        True  # currently required by nip 47 specs, might change in future
-    )
-    payment_status: PaymentStatus | None = None
-    poll_interval = PAYMENT_STATUS_POLL_INITIAL_INTERVAL_SECONDS
-    while wait_for_preimage:
-        payment_status = await check_transaction_status(wallet_id, payment_hash)
-        if payment_status and payment_status.success:
-            break
-        if payment_status.failed:
-            return {
-                "error": {
-                    "code": "PAYMENT_FAILED",
-                    "message": "Payment failed.",
-                },
-                "in_budget": in_budget,
-            }
-        await asyncio.sleep(poll_interval)
-        poll_interval = min(
-            poll_interval * PAYMENT_STATUS_POLL_BACKOFF_MULTIPLIER,
-            PAYMENT_STATUS_POLL_MAX_INTERVAL_SECONDS,
-        )
+    payment_status, wait_error = await _wait_for_payment(wallet_id, payment_hash)
+    if wait_error:
+        return {"error": wait_error, "in_budget": in_budget}
     if not payment_status:
         raise Exception("Payment status not found")
     return {
