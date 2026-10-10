@@ -397,3 +397,29 @@ async def test_notification_listener_is_bounded_owned_and_removed(monkeypatch):
         ("register", "ext_nwcprovider_notifications"),
         ("cancel", "listener-task"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_listener_is_unregistered_on_stop(monkeypatch):
+    import importlib
+
+    lnbits_tasks = importlib.import_module("lnbits.tasks")
+    registry: dict = {}
+
+    def fake_register_invoice_listener(queue, name=None):
+        registry[name] = queue
+
+    monkeypatch.setattr(lnbits_tasks, "invoice_listeners", registry, raising=False)
+    monkeypatch.setattr(
+        tasks, "register_invoice_listener", fake_register_invoice_listener
+    )
+    monkeypatch.setattr(tasks, "task_manager", None)
+
+    handles = tasks._start_notification_listener(None)
+    await asyncio.sleep(0)
+    assert "ext_nwcprovider" in registry
+
+    tasks._stop_notification_listener(handles)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert "ext_nwcprovider" not in registry

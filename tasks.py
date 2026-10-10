@@ -698,8 +698,19 @@ async def _legacy_notification_forwarder(queue: asyncio.Queue):
     """Older LNbits without task_manager: forward from its unbounded queue."""
     lnbits_queue: asyncio.Queue = asyncio.Queue()
     register_invoice_listener(lnbits_queue, "ext_nwcprovider")
-    while True:
-        _enqueue_notification(queue, await lnbits_queue.get())
+    try:
+        while True:
+            _enqueue_notification(queue, await lnbits_queue.get())
+    finally:
+        # Unregister, or LNbits keeps filling the abandoned queue after stop.
+        try:
+            import lnbits.tasks as lnbits_tasks
+
+            listeners = getattr(lnbits_tasks, "invoice_listeners", None)
+            if listeners and listeners.get("ext_nwcprovider") is lnbits_queue:
+                listeners.pop("ext_nwcprovider", None)
+        except Exception as e:
+            logger.debug(f"nwcprovider: unregistering legacy listener: {e}")
 
 
 def _start_notification_listener(sp: NWCServiceProvider) -> list[Any]:
