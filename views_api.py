@@ -4,8 +4,8 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from lnbits.core.crud import get_wallets
-from lnbits.core.models import WalletTypeInfo
-from lnbits.decorators import check_admin, require_admin_key
+from lnbits.core.models import User, WalletTypeInfo
+from lnbits.decorators import check_admin, check_user_exists, require_admin_key
 from loguru import logger
 from pynostr.key import PrivateKey
 
@@ -86,13 +86,14 @@ async def api_get_nwcs(
 async def api_get_all_nwcs(
     include_expired: bool = False,
     calculate_spent_budget: bool = False,
-    wallet: WalletTypeInfo = Depends(require_admin_key),
+    user: User = Depends(check_user_exists),
 ) -> list[NWCGetAllResponse]:
-    """Get all NWC connections across all wallets for the current user."""
-    user_id = wallet.wallet.user
-
-    # Get all wallets for this user
-    user_wallets = await get_wallets(user_id)
+    """
+    Get all NWC connections across all wallets for the current user.
+    Requires the logged-in user (session), not a wallet key: one wallet's
+    admin key must not reveal the user's other wallets.
+    """
+    user_wallets = await get_wallets(user.id)
 
     out = []
     for user_wallet in user_wallets:

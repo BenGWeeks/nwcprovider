@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -122,7 +123,9 @@ async def test_process_invoice_gives_up_on_pending_payment_after_deadline(
 
 
 @pytest.mark.asyncio
-async def test_process_invoice_settling_just_before_deadline_succeeds(monkeypatch):
+async def test_process_invoice_settling_on_final_poll_at_deadline_succeeds(
+    monkeypatch,
+):
     async def fake_tracked_spend_nwc(*args, **kwargs):
         return True, "a" * 64
 
@@ -157,3 +160,133 @@ async def test_process_invoice_settling_just_before_deadline_succeeds(monkeypatc
     # The final poll at the deadline still observes the settlement.
     assert result["preimage"] == "c" * 64
     assert result["paid"] is True
+
+
+@pytest.mark.asyncio
+async def test_wait_for_payment_bounds_a_hanging_status_call(monkeypatch):
+    monkeypatch.setattr(tasks, "PAYMENT_STATUS_POLL_DEADLINE_SECONDS", 0.05)
+    release = asyncio.Event()
+
+    async def hanging_check_transaction_status(wallet_id: str, payment_hash: str):
+        await release.wait()
+        return SimpleNamespace(success=True, failed=False)
+
+    monkeypatch.setattr(
+        tasks, "check_transaction_status", hanging_check_transaction_status
+    )
+
+    status, error = await asyncio.wait_for(
+        tasks._wait_for_payment("wallet123", "a" * 64), timeout=2
+    )
+
+    assert status is None
+    assert error is not None
+    assert error["code"] == "OTHER"
+    release.set()  # let the shielded status check finish cleanly
+    await asyncio.sleep(0)
+
+
+def _payment(**kw):
+    base = {
+        "bolt11": "lnbc1example",
+        "success": False,
+        "failed": False,
+        "pending": True,
+        "is_expired": False,
+        "is_in": False,
+        "is_out": True,
+        "msat": -21000,
+        "fee": -2000,
+        "payment_hash": "a" * 64,
+        "preimage": None,
+        "memo": "memo",
+        "extra": {},
+        "expiry": None,
+        "wallet_id": "wallet123",
+    }
+    base.update(kw)
+    from datetime import datetime, timezone
+
+    base.setdefault("time", datetime(2026, 1, 1, tzinfo=timezone.utc))
+    return SimpleNamespace(**base)
+
+
+@pytest.fixture
+def fake_bolt11(monkeypatch):
+    monkeypatch.setattr(
+        tasks,
+        "bolt11_decode",
+        lambda _: SimpleNamespace(
+            description="desc", description_hash=None, date=1767225600
+        ),
+    )
+
+
+def test_failed_payment_is_not_settled(fake_bolt11):
+    data = tasks._build_transaction_data(
+        _payment(failed=True, pending=False, is_expired=False)
+    )
+    assert data["state"] == "failed"
+    assert data["settled_at"] is None
+    assert data["preimage"] is None
+
+
+def test_expired_incoming_invoice_reports_expired(fake_bolt11):
+    data = tasks._build_transaction_data(
+        _payment(
+            is_in=True,
+            is_out=False,
+            msat=21000,
+            fee=0,
+            failed=True,
+            pending=False,
+            is_expired=True,
+        )
+    )
+    assert data["state"] == "expired"
+    assert data["settled_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_payment_sent_reports_confirmed_outcome_when_row_still_pending(
+    monkeypatch, fake_bolt11
+):
+    async def fake_get_wallet_payment(wallet_id, payment_hash):
+        return _payment()  # LNbits row not yet updated
+
+    sent = []
+
+    async def fake_send(sp, wallet_id, notification_type, notification, **kw):
+        sent.append((notification_type, notification, kw))
+
+    monkeypatch.setattr(tasks, "get_wallet_payment", fake_get_wallet_payment)
+    monkeypatch.setattr(tasks, "_send_notification_to_wallet", fake_send)
+
+    await tasks._notify_payment_sent(
+        None,
+        "wallet123",
+        "b" * 64,
+        {"payment_hash": "a" * 64, "preimage": "c" * 64, "fee_msats": 1000},
+    )
+
+    assert len(sent) == 1
+    notification_type, notification, kw = sent[0]
+    assert notification_type == "payment_sent"
+    assert notification["state"] == "settled"
+    assert notification["preimage"] == "c" * 64
+    assert notification["fees_paid"] == 1000
+    assert notification["settled_at"]
+    assert kw["exclude_pubkey"] == "b" * 64
+
+
+@pytest.mark.asyncio
+async def test_invoice_listener_ignores_unsettled_or_outgoing(monkeypatch):
+    sent = []
+
+    async def fake_send(*a, **kw):
+        sent.append(a)
+
+    monkeypatch.setattr(tasks, "_send_notification_to_wallet", fake_send)
+    await tasks._on_invoice_paid(None, _payment(is_in=True, is_out=False))
+    await tasks._on_invoice_paid(None, _payment(success=True, pending=False))
+    assert sent == []

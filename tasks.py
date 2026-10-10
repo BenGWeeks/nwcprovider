@@ -74,7 +74,9 @@ def _build_transaction_data(payment: Payment) -> dict:
     Used for lookup_invoice, list_transactions, and notification payloads.
     """
     invoice_data = bolt11_decode(payment.bolt11)
-    is_settled = not payment.pending
+    # Only a successful payment is settled; LNbits also marks failed (and
+    # expired incoming) payments as not pending.
+    is_settled = payment.success
     timestamp = int(payment.time.timestamp()) or int(invoice_data.date)
     expiry = int(payment.expiry.timestamp()) if payment.expiry else timestamp + 3600
     preimage = (
@@ -84,6 +86,9 @@ def _build_transaction_data(payment: Payment) -> dict:
     # Derive NIP-47 state from Payment status
     if payment.success:
         state = "settled"
+    elif payment.is_in and payment.is_expired:
+        # LNbits marks unpaid expired invoices as failed; NIP-47 says expired.
+        state = "expired"
     elif payment.failed:
         state = "failed"
     elif payment.is_expired:
@@ -157,10 +162,16 @@ async def _wait_for_payment(
     poll_interval = PAYMENT_STATUS_POLL_INITIAL_INTERVAL_SECONDS
     deadline = time.monotonic() + PAYMENT_STATUS_POLL_DEADLINE_SECONDS
     while True:  # NIP-47 currently requires waiting for the preimage
-        payment_status = await check_transaction_status(wallet_id, payment_hash)
+        try:
+            payment_status = await asyncio.wait_for(
+                asyncio.shield(check_transaction_status(wallet_id, payment_hash)),
+                timeout=max(deadline - time.monotonic(), 0.001),
+            )
+        except asyncio.TimeoutError:
+            payment_status = None  # status check outlived the deadline
         if payment_status and payment_status.success:
             return payment_status, None
-        if payment_status.failed:
+        if payment_status and payment_status.failed:
             return None, {"code": "PAYMENT_FAILED", "message": "Payment failed."}
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -281,11 +292,10 @@ async def _on_pay_invoice(
     if error:
         return [(None, error, [])]
     preimage = res.get("preimage")
-    payment_hash = res.get("payment_hash")
     out = {
         "preimage": preimage,
     }
-    await _notify_payment_sent(sp, nwc.wallet, pubkey, payment_hash)
+    await _notify_payment_sent(sp, nwc.wallet, pubkey, res)
     return [(out, None, [])]
 
 
@@ -293,14 +303,27 @@ async def _notify_payment_sent(
     sp: NWCServiceProvider,
     wallet_id: str,
     exclude_pubkey: str,
-    payment_hash: str | None,
+    res: dict,
 ) -> None:
-    """Send payment_sent notification to other keys on this wallet."""
+    """
+    Send payment_sent notification to other keys on this wallet. `res` is the
+    successful result of _process_invoice for this payment.
+    """
     try:
+        payment_hash = res.get("payment_hash")
         if payment_hash:
             payment = await get_wallet_payment(wallet_id, payment_hash)
             if payment:
                 notification = _build_transaction_data(payment)
+                if notification["state"] != "settled":
+                    # The funding source confirmed the payment but LNbits has
+                    # not persisted it yet: report the confirmed outcome.
+                    notification.update(
+                        state="settled",
+                        preimage=res.get("preimage"),
+                        fees_paid=abs(int(res.get("fee_msats") or 0)),
+                        settled_at=int(time.time()),
+                    )
                 await _send_notification_to_wallet(
                     sp,
                     wallet_id,
@@ -366,7 +389,7 @@ async def _on_multi_pay_invoice(
                     [["d", invoice_id if invoice_id else payment_hash]],
                 )
                 results.append(r)
-                await _notify_payment_sent(sp, nwc.wallet, pubkey, payment_hash)
+                await _notify_payment_sent(sp, nwc.wallet, pubkey, res)
         except Exception as e:
             results.append((None, {"code": "INTERNAL", "message": str(e)}, []))
         await asyncio.sleep(0)
@@ -610,6 +633,8 @@ async def _on_get_info(
 
 async def _on_invoice_paid(sp: NWCServiceProvider, payment: Payment):
     """Handle an incoming payment by sending payment_received notifications."""
+    if not (payment.is_in and payment.success):
+        return
     try:
         notification = _build_transaction_data(payment)
         await _send_notification_to_wallet(
