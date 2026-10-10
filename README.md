@@ -34,7 +34,7 @@ Base: upstream [`lnbits/nwcprovider` v1.1.3](https://github.com/lnbits/nwcprovid
 Known limitations of #30 that we have not changed (see the soak-test plan):
 
 - `payment_sent` fires only for payments made through this NWC provider (`pay_invoice` / `multi_pay_invoice`). Payments from the LNbits UI, other extensions or the API produce no `payment_sent`, and neither does a payment that settles after the 300 s deadline. The paying connection is excluded on purpose.
-- Notifications are best-effort, with no retry or persistence. Each publish waits at most 10 s for the relay, then it is dropped with a warning in the log. Notifications for payments made while LNbits is down are never sent, and clients have to poll `list_transactions` to catch up.
+- Notifications are best-effort, with no retry or persistence. Each publish waits at most 10 s for the relay, then it is dropped with a warning in the log. At most 1,000 incoming payments wait to be announced; beyond that they are dropped, also with a warning. Notifications for payments made while LNbits is down are never sent, and clients have to poll `list_transactions` to catch up.
 - The `lud16` picker builds the address domain from the request host, so it may include a port. It also only finds `lnurlp` when that extension is installed at the default path at startup.
 
 `weeks-family` (`1.1.1+wf2`) is superseded by this branch and kept only for history.

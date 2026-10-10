@@ -50,6 +50,8 @@ PAYMENT_STATUS_POLL_DEADLINE_SECONDS = 300.0
 # Notifications are best-effort: never let a stalled relay hold up the pay
 # response or the notification worker for longer than this per event.
 NOTIFICATION_SEND_TIMEOUT_SECONDS = 10.0
+# Incoming payments waiting to be announced; beyond this they are dropped.
+NOTIFICATION_QUEUE_MAXSIZE = 1000
 
 
 async def _check(nwc: NWCKey | None, method: str) -> dict | None:
@@ -675,42 +677,65 @@ async def _on_invoice_paid(sp: NWCServiceProvider, payment: Payment):
         logger.debug(f"Failed to handle invoice paid notification: {e}")
 
 
-async def _notification_listener(sp: NWCServiceProvider):
-    """
-    Legacy (pre-task_manager LNbits) listener for incoming paid invoices.
-    """
-    queue: asyncio.Queue = asyncio.Queue()
-    register_invoice_listener(queue, "ext_nwcprovider")
+def _enqueue_notification(queue: asyncio.Queue, payment: Payment) -> None:
+    """Never blocks LNbits' dispatcher; drops (logged) when the backlog is full."""
+    try:
+        queue.put_nowait(payment)
+    except asyncio.QueueFull:
+        logger.warning(
+            "nwcprovider: notification backlog full, dropped payment_received "
+            f"for {payment.payment_hash}"
+        )
+
+
+async def _notification_worker(sp: NWCServiceProvider, queue: asyncio.Queue):
     while True:
         payment = await queue.get()
         await _on_invoice_paid(sp, payment)
 
 
-def _start_notification_listener(sp: NWCServiceProvider) -> Any:
+async def _legacy_notification_forwarder(queue: asyncio.Queue):
+    """Older LNbits without task_manager: forward from its unbounded queue."""
+    lnbits_queue: asyncio.Queue = asyncio.Queue()
+    register_invoice_listener(lnbits_queue, "ext_nwcprovider")
+    while True:
+        _enqueue_notification(queue, await lnbits_queue.get())
+
+
+def _start_notification_listener(sp: NWCServiceProvider) -> list[Any]:
     """
-    Subscribe to incoming payments for payment_received notifications. With
-    task_manager the listener is an owned task that _stop_notification_listener
-    removes, so LNbits stops queueing payments for it when we stop.
+    Subscribe to incoming payments for payment_received notifications.
+    LNbits hands each payment to a callback that only enqueues it into our
+    bounded queue; an owned worker publishes, so a relay outage can neither
+    block LNbits nor grow memory without limit. Returns the handles that
+    _stop_notification_listener must remove.
     """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=NOTIFICATION_QUEUE_MAXSIZE)
+    handles: list[Any] = [asyncio.create_task(_notification_worker(sp, queue))]
     if task_manager is None:
-        return asyncio.create_task(_notification_listener(sp))
+        handles.append(asyncio.create_task(_legacy_notification_forwarder(queue)))
+        return handles
 
     async def on_paid(payment: Payment) -> None:
-        await _on_invoice_paid(sp, payment)
+        _enqueue_notification(queue, payment)
 
-    return task_manager.register_invoice_listener(
-        on_paid, name="ext_nwcprovider_notifications"
+    handles.append(
+        task_manager.register_invoice_listener(
+            on_paid, name="ext_nwcprovider_notifications"
+        )
     )
+    return handles
 
 
-def _stop_notification_listener(listener: Any) -> None:
-    try:
-        if isinstance(listener, asyncio.Task):
-            listener.cancel()
-        elif task_manager is not None:
-            task_manager.cancel_task(listener)
-    except Exception as e:  # already removed / shutting down
-        logger.debug(f"nwcprovider: stopping notification listener: {e}")
+def _stop_notification_listener(handles: list[Any]) -> None:
+    for handle in handles:
+        try:
+            if isinstance(handle, asyncio.Task):
+                handle.cancel()
+            elif task_manager is not None:
+                task_manager.cancel_task(handle)
+        except Exception as e:  # already removed / shutting down
+            logger.debug(f"nwcprovider: stopping notification listener: {e}")
 
 
 async def handle_nwc():

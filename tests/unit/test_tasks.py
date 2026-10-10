@@ -352,22 +352,47 @@ async def test_notification_send_is_bounded_when_relay_stalls(monkeypatch):
     )
 
 
-def test_notification_listener_is_owned_and_removed(monkeypatch):
+@pytest.mark.asyncio
+async def test_notification_listener_is_bounded_owned_and_removed(monkeypatch):
     calls = []
+    callbacks = []
 
     class FakeTaskManager:
         def register_invoice_listener(self, func, name=None):
             calls.append(("register", name))
+            callbacks.append(func)
             return "listener-task"
 
         def cancel_task(self, task):
             calls.append(("cancel", task))
 
+    stalled = asyncio.Event()
+
+    async def stalled_on_invoice_paid(sp, payment):
+        stalled.set()
+        await asyncio.Event().wait()  # relay outage: publishing never returns
+
     monkeypatch.setattr(tasks, "task_manager", FakeTaskManager())
+    monkeypatch.setattr(tasks, "NOTIFICATION_QUEUE_MAXSIZE", 3)
+    monkeypatch.setattr(tasks, "_on_invoice_paid", stalled_on_invoice_paid)
 
-    listener = tasks._start_notification_listener(None)
-    tasks._stop_notification_listener(listener)
+    handles = tasks._start_notification_listener(None)
+    worker = handles[0]
+    on_paid = callbacks[0]
 
+    # LNbits dispatches far more payments than can be published.
+    for i in range(50):
+        await on_paid(SimpleNamespace(payment_hash=f"{i:064x}"))
+    await asyncio.wait_for(stalled.wait(), timeout=2)
+    for i in range(50, 100):
+        await on_paid(SimpleNamespace(payment_hash=f"{i:064x}"))
+
+    queue = worker.get_coro().cr_frame.f_locals["queue"]
+    assert queue.qsize() <= 3
+
+    tasks._stop_notification_listener(handles)
+    await asyncio.sleep(0)
+    assert worker.cancelled()
     assert calls == [
         ("register", "ext_nwcprovider_notifications"),
         ("cancel", "listener-task"),
