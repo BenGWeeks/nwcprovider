@@ -54,7 +54,13 @@ class BaseModel:
         super().__init_subclass__(**kwargs)
 
 
+def field_validator(*fields, **kwargs):
+    # Pass-through stand-in for pydantic 2's decorator; the stub never validates.
+    return lambda fn: fn
+
+
 pydantic_mod.BaseModel = BaseModel
+pydantic_mod.field_validator = field_validator
 sys.modules["pydantic"] = pydantic_mod
 
 # Mock all lnbits modules

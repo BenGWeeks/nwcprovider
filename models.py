@@ -1,10 +1,11 @@
 # Data models for your extension
 
+import math
 import time
 from sqlite3 import Row
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class NWCKey(BaseModel):
@@ -54,10 +55,18 @@ class NWCBudget(BaseModel):
 
 
 class NWCNewBudget(BaseModel):
-    pubkey: str | None
+    pubkey: str | None = None
     budget_msats: int
     refresh_window: int
     created_at: int
+
+    @field_validator("budget_msats", "refresh_window", "created_at", mode="before")
+    @classmethod
+    def _truncate_floats(cls, value: object) -> object:
+        # Pydantic 1 truncated floats here (UI sends 1.1 sats * 1000)
+        if isinstance(value, float) and math.isfinite(value):
+            return int(value)
+        return value
 
 
 # CRUD models
@@ -105,6 +114,32 @@ class NWCRegistrationRequest(BaseModel):
     expires_at: int
     budgets: list[NWCNewBudget]
     lud16: str | None = None
+
+    @field_validator("lud16")
+    @classmethod
+    def _valid_lud16(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        value = value.strip()
+        local, sep, domain = value.partition("@")
+        if (
+            len(value) > 320
+            or not sep
+            or not local
+            or "." not in domain
+            or any(c.isspace() for c in value)
+            or "@" in domain
+        ):
+            raise ValueError("lud16 must be a Lightning address like name@example.com")
+        return value
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def _normalize_expiry(cls, value: object) -> object:
+        # Preserve the previous API's conversion of fractional Unix timestamps.
+        if isinstance(value, float) and math.isfinite(value):
+            return int(value)
+        return value
 
 
 class NWCGetResponse(BaseModel):

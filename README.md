@@ -13,13 +13,14 @@
 > ## Deployment branch: `black-panther`
 >
 > This is **not** the upstream repo. `black-panther` is the build that runs on the
-> two LNbits 1.6.1 instances on the host `black-panther` (`lnbits-family` and
-> `lnbits-business`). It is shown in LNbits as **NWC Service Provider (BP)** and
+> two LNbits instances on the host `black-panther` (`lnbits-family` and
+> `lnbits-business`). From `1.2.1+bp1` it needs LNbits 1.7.0 or later (Pydantic 2);
+> an instance still on LNbits 1.6.x must stay on `1.1.3+bp1`. It is shown in LNbits as **NWC Service Provider (BP)** and
 > is versioned `<upstream>+bpN`. It **supersedes `weeks-family`** (`1.1.1+wf2`).
 
 ### What it carries vs upstream
 
-Base: upstream [`lnbits/nwcprovider` v1.1.3](https://github.com/lnbits/nwcprovider/releases/tag/v1.1.3).
+Base: upstream [`lnbits/nwcprovider` v1.2.1](https://github.com/lnbits/nwcprovider/releases/tag/v1.2.1), which is v1.1.3 plus the Pydantic 2 migration for LNbits 1.7 ([#60](https://github.com/lnbits/nwcprovider/pull/60)). The patches below were merged onto it unchanged from `1.1.3+bp1`.
 
 | Patch                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Status in `black-panther`                                                                                                                                                                                                                                                     | Upstream status                                                                                                                                                                  |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -54,7 +55,7 @@ and restores the extension from it when the container is recreated.
    bump `+bp2`, `+bp3` and so on.
 3. Run the tests: `pytest tests/unit tests/standalone` in an LNbits venv. Run the integration tests
    if the change touches request handling.
-4. Tag `v<version>` (for example `v1.1.3+bp1`) and push the tag. Then update `extensions.json`: set the
+4. Tag `v<version>` (for example `v1.2.1+bp1`) and push the tag. Then update `extensions.json`: set the
    `version`, `archive` and `hash` (`curl -sL <archive> | sha256sum`), and push to `black-panther`.
 5. Before upgrading each instance (family first, then business), back up `/app/lnbits/extensions/nwcprovider`
    and `/data/ext_nwcprovider.sqlite3`. Install the new release through Admin → Extensions, picking the
@@ -80,7 +81,7 @@ Tracking issue: [#1](https://github.com/BenGWeeks/nwcprovider/issues/1).
 - [ ] **Migrations**: upgrade from `1.1.1+wf2` and from upstream `1.1.2` (adds the `lud16` column, while existing keys keep `notifications` off). Rolling back to the old build with the new column in place, and restoring the pre-upgrade DB backup, must both work.
 - [ ] **NIP-04 vs NIP-44 clients**: Alby Go / Alby Hub, @getalby/sdk `NWCClient.subscribeNotifications`, Lightning Piggy Mobile, Amethyst and Primal. Clients that only support NIP-44 (kind 23197) get nothing, because the provider does not advertise `encryption`. Record which clients work.
 - [ ] **Notifications watcher**: with `lightning-piggy-watcher` registered for the same wallet, the user gets **one** push per payment, not one from the watcher plus one from the app's own notification subscription.
-- [ ] **Existing methods**: `get_info`, `get_balance`, `make_invoice`, `pay_invoice`, `multi_pay_invoice`, `lookup_invoice` and `list_transactions` (with paging and filters) behave as on v1.1.3. `get_info` lists `notifications` only for permitted keys.
+- [ ] **Existing methods**: `get_info`, `get_balance`, `make_invoice`, `pay_invoice`, `multi_pay_invoice`, `lookup_invoice` and `list_transactions` (with paging and filters) behave as on v1.2.1. `get_info` lists `notifications` only for permitted keys.
 - [ ] **UI**: create, edit and delete connections. The "all wallets" view lists only the current user's wallets. The `lud16` picker works with and without the lnurlp extension.
 
 # NWC Service Provider Extension for [LNbits](https://github.com/lnbits/lnbits)
