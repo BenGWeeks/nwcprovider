@@ -60,6 +60,14 @@ class NWCNewBudget(BaseModel):
     refresh_window: int
     created_at: int
 
+    @field_validator("budget_msats", "refresh_window", "created_at", mode="before")
+    @classmethod
+    def _truncate_floats(cls, value: object) -> object:
+        # Pydantic 1 truncated fractional numbers here (e.g. 1.1 sats * 1000 from the UI); keep accepting them
+        if isinstance(value, float) and math.isfinite(value):
+            return int(value)
+        return value
+
 
 # CRUD models
 class CreateNWCKey(BaseModel):
@@ -106,6 +114,24 @@ class NWCRegistrationRequest(BaseModel):
     expires_at: int
     budgets: list[NWCNewBudget]
     lud16: str | None = None
+
+    @field_validator("lud16")
+    @classmethod
+    def _valid_lud16(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        value = value.strip()
+        local, sep, domain = value.partition("@")
+        if (
+            len(value) > 320
+            or not sep
+            or not local
+            or "." not in domain
+            or any(c.isspace() for c in value)
+            or "@" in domain
+        ):
+            raise ValueError("lud16 must be a Lightning address like name@example.com")
+        return value
 
     @field_validator("expires_at", mode="before")
     @classmethod

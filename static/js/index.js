@@ -461,7 +461,7 @@ window.app = Vue.createApp({
         if (permission.value) data.permissions.push(permission.key)
       }
       for (const budget of this.connectDialog.data.budgets) {
-        const budget_msats = budget.budget_sats * 1000
+        const budget_msats = Math.round(budget.budget_sats * 1000)
         let refresh_window = 0
         switch (budget.expiry) {
           case 'Daily':
