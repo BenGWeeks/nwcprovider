@@ -29,6 +29,9 @@ build-constraint-dependencies = ["scikit-build-core<0.10"]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
+exclude = [
+  "tests/standalone/",
+]
 
 [[tool.mypy.overrides]]
 module = [

@@ -14,12 +14,18 @@ from lnbits.core.services import (
 from lnbits.db import Filters
 from lnbits.exceptions import PaymentError
 from lnbits.settings import settings
+from lnbits.tasks import register_invoice_listener
+
+try:
+    from lnbits.task_manager import task_manager
+except ImportError:  # older LNbits: fall back to the queue-based listener
+    task_manager = None  # type: ignore[assignment]
 from lnbits.wallets.base import PaymentStatus
 from loguru import logger
 
-from .crud import get_config_nwc, get_nwc, tracked_spend_nwc
+from .crud import get_config_nwc, get_nwc, get_wallet_nwcs, tracked_spend_nwc
 from .execution_queue import execution_queue
-from .models import GetNWC, NWCKey, TrackedSpendNWC
+from .models import GetNWC, GetWalletNWC, NWCKey, TrackedSpendNWC
 from .nwcp import NWCServiceProvider
 from .paranoia import (
     assert_boolean,
@@ -37,6 +43,15 @@ from .permission import nwc_permissions
 PAYMENT_STATUS_POLL_INITIAL_INTERVAL_SECONDS = 1.0
 PAYMENT_STATUS_POLL_MAX_INTERVAL_SECONDS = 60.0
 PAYMENT_STATUS_POLL_BACKOFF_MULTIPLIER = 2.0
+# Hard cap on how long a single pay request keeps polling a payment that is
+# neither settled nor failed (e.g. a stuck HTLC). Without it the request task
+# lives forever. Most NWC clients give up long before this anyway.
+PAYMENT_STATUS_POLL_DEADLINE_SECONDS = 300.0
+# Notifications are best-effort: never let a stalled relay hold up the pay
+# response or the notification worker for longer than this per event.
+NOTIFICATION_SEND_TIMEOUT_SECONDS = 10.0
+# Incoming payments waiting to be announced; beyond this they are dropped.
+NOTIFICATION_QUEUE_MAXSIZE = 1000
 
 
 async def _check(nwc: NWCKey | None, method: str) -> dict | None:
@@ -61,6 +76,143 @@ async def _check(nwc: NWCKey | None, method: str) -> dict | None:
             "message": "This public key is not allowed to do this operation.",
         }
     return None
+
+
+def _build_transaction_data(payment: Payment) -> dict:
+    """
+    Build the NIP-47 transaction data dict from a Payment object.
+    Used for lookup_invoice, list_transactions, and notification payloads.
+    """
+    invoice_data = bolt11_decode(payment.bolt11)
+    # Only a successful payment is settled; LNbits also marks failed (and
+    # expired incoming) payments as not pending.
+    is_settled = payment.success
+    timestamp = int(payment.time.timestamp()) or int(invoice_data.date)
+    expiry = int(payment.expiry.timestamp()) if payment.expiry else timestamp + 3600
+    preimage = (
+        payment.preimage
+        or "0000000000000000000000000000000000000000000000000000000000000000"
+    )
+    # Derive NIP-47 state from Payment status
+    if payment.success:
+        state = "settled"
+    elif payment.is_in and payment.is_expired:
+        # LNbits marks unpaid expired invoices as failed; NIP-47 says expired.
+        state = "expired"
+    elif payment.failed:
+        state = "failed"
+    elif payment.is_expired:
+        state = "expired"
+    else:
+        state = "pending"
+    res: dict = {
+        "type": "outgoing" if payment.is_out else "incoming",
+        "state": state,
+        "invoice": payment.bolt11,
+        # Fallback chain so a human-readable description reaches the NWC client.
+        "description": (
+            (payment.extra or {}).get("comment")
+            or invoice_data.description
+            or payment.memo
+        ),
+        "preimage": preimage if is_settled or payment.is_in else None,
+        "payment_hash": payment.payment_hash,
+        "amount": abs(payment.msat),
+        "fees_paid": abs(payment.fee),
+        "created_at": timestamp,
+        "expires_at": expiry,
+        "settled_at": timestamp if is_settled else None,
+        "metadata": {},
+    }
+    if invoice_data.description_hash:
+        res["description_hash"] = invoice_data.description_hash
+    return res
+
+
+async def _send_notification_to_wallet(
+    sp: NWCServiceProvider,
+    wallet_id: str,
+    notification_type: str,
+    notification: dict,
+    exclude_pubkey: str | None = None,
+):
+    """
+    Send a notification to all NWC keys on a wallet that have the
+    'notifications' permission. Best-effort: errors are logged, never raised.
+    """
+    try:
+        nwc_keys = await get_wallet_nwcs(GetWalletNWC(wallet=wallet_id))
+        for nwc_key in nwc_keys:
+            if exclude_pubkey and nwc_key.pubkey == exclude_pubkey:
+                continue
+            permissions = nwc_key.get_permissions()
+            if "notifications" not in permissions:
+                continue
+            try:
+                await asyncio.wait_for(
+                    sp.send_notification(
+                        nwc_key.pubkey, notification_type, notification
+                    ),
+                    timeout=NOTIFICATION_SEND_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"nwcprovider: dropped {notification_type} notification to "
+                    f"{nwc_key.pubkey[:8]}... (relay not reachable)"
+                )
+            except Exception as e:
+                logger.debug(
+                    f"Failed to send {notification_type} notification "
+                    f"to {nwc_key.pubkey[:8]}...: {e}"
+                )
+    except Exception as e:
+        logger.debug(f"Failed to send notifications for wallet {wallet_id}: {e}")
+
+
+async def _wait_for_payment(
+    wallet_id: str, payment_hash: str
+) -> tuple[PaymentStatus | None, dict | None]:
+    """
+    Poll an outgoing payment (with back-off) until it settles, fails, or the
+    deadline passes. Returns (status, None) on success or (None, error).
+    """
+    payment_status: PaymentStatus | None = None
+    poll_interval = PAYMENT_STATUS_POLL_INITIAL_INTERVAL_SECONDS
+    deadline = time.monotonic() + PAYMENT_STATUS_POLL_DEADLINE_SECONDS
+    while True:  # NIP-47 currently requires waiting for the preimage
+        try:
+            # Read-only status query: safe to cancel when the deadline hits.
+            payment_status = await asyncio.wait_for(
+                check_transaction_status(wallet_id, payment_hash),
+                timeout=max(deadline - time.monotonic(), 0.001),
+            )
+        except asyncio.TimeoutError:
+            payment_status = None  # status check outlived the deadline
+        if payment_status and payment_status.success:
+            return payment_status, None
+        if payment_status and payment_status.failed:
+            return None, {"code": "PAYMENT_FAILED", "message": "Payment failed."}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Still pending: report an error rather than falling through to
+            # the success path (which would hand back a zero preimage). The
+            # payment may still settle later; lookup_invoice reports it.
+            logger.warning(
+                f"nwcprovider: payment {payment_hash} still pending after "
+                f"{PAYMENT_STATUS_POLL_DEADLINE_SECONDS:.0f}s, giving up waiting"
+            )
+            return None, {
+                "code": "OTHER",
+                "message": (
+                    "Payment is still pending. It may still complete; "
+                    "check its status with lookup_invoice."
+                ),
+            }
+        await asyncio.sleep(min(poll_interval, remaining))
+        poll_interval = min(
+            poll_interval * PAYMENT_STATUS_POLL_BACKOFF_MULTIPLIER,
+            PAYMENT_STATUS_POLL_MAX_INTERVAL_SECONDS,
+        )
 
 
 async def _process_invoice(
@@ -110,28 +262,9 @@ async def _process_invoice(
             raise e
     if not payment_hash:
         raise Exception("Payment hash not found")
-    wait_for_preimage = (
-        True  # currently required by nip 47 specs, might change in future
-    )
-    payment_status: PaymentStatus | None = None
-    poll_interval = PAYMENT_STATUS_POLL_INITIAL_INTERVAL_SECONDS
-    while wait_for_preimage:
-        payment_status = await check_transaction_status(wallet_id, payment_hash)
-        if payment_status.success:
-            break
-        if payment_status.failed:
-            return {
-                "error": {
-                    "code": "PAYMENT_FAILED",
-                    "message": "Payment failed.",
-                },
-                "in_budget": in_budget,
-            }
-        await asyncio.sleep(poll_interval)
-        poll_interval = min(
-            poll_interval * PAYMENT_STATUS_POLL_BACKOFF_MULTIPLIER,
-            PAYMENT_STATUS_POLL_MAX_INTERVAL_SECONDS,
-        )
+    payment_status, wait_error = await _wait_for_payment(wallet_id, payment_hash)
+    if wait_error:
+        return {"error": wait_error, "in_budget": in_budget}
     if not payment_status:
         raise Exception("Payment status not found")
     return {
@@ -181,8 +314,58 @@ async def _on_pay_invoice(
     out = {
         "preimage": preimage,
     }
-    # await log_nwc(pubkey, payload)
+    await _notify_payment_sent(sp, nwc.wallet, pubkey, res)
     return [(out, None, [])]
+
+
+def _settled_fee_msat(payment: Payment, routing_fee_msat: int | None) -> int:
+    """
+    Fee LNbits records when it settles an external payment: the routing fee
+    plus its own service fee (mirrors lnbits.core.services.payments).
+    """
+    try:
+        from lnbits.core.services.payments import service_fee
+
+        lnbits_fee = abs(service_fee(payment.amount, internal=False))
+    except Exception:
+        lnbits_fee = 0
+    return abs(int(routing_fee_msat or 0)) + lnbits_fee
+
+
+async def _notify_payment_sent(
+    sp: NWCServiceProvider,
+    wallet_id: str,
+    exclude_pubkey: str,
+    res: dict,
+) -> None:
+    """
+    Send payment_sent notification to other keys on this wallet. `res` is the
+    successful result of _process_invoice for this payment.
+    """
+    try:
+        payment_hash = res.get("payment_hash")
+        if payment_hash:
+            payment = await get_wallet_payment(wallet_id, payment_hash)
+            if payment:
+                notification = _build_transaction_data(payment)
+                if notification["state"] != "settled":
+                    # The funding source confirmed the payment but LNbits has
+                    # not persisted it yet: report the confirmed outcome.
+                    notification.update(
+                        state="settled",
+                        preimage=res.get("preimage"),
+                        fees_paid=_settled_fee_msat(payment, res.get("fee_msats")),
+                        settled_at=int(time.time()),
+                    )
+                await _send_notification_to_wallet(
+                    sp,
+                    wallet_id,
+                    "payment_sent",
+                    notification,
+                    exclude_pubkey=exclude_pubkey,
+                )
+    except Exception as e:
+        logger.debug(f"Failed to send payment_sent notification: {e}")
 
 
 async def _on_multi_pay_invoice(
@@ -230,14 +413,16 @@ async def _on_multi_pay_invoice(
             if error:
                 results.append((None, error, []))
             else:
+                payment_hash = res.get("payment_hash")
                 r = (
                     {
                         "preimage": res.get("preimage"),
                     },
                     None,
-                    [["d", invoice_id if invoice_id else res.get("payment_hash")]],
+                    [["d", invoice_id if invoice_id else payment_hash]],
                 )
                 results.append(r)
+                await _notify_payment_sent(sp, nwc.wallet, pubkey, res)
         except Exception as e:
             results.append((None, {"code": "INTERNAL", "message": str(e)}, []))
         await asyncio.sleep(0)
@@ -351,31 +536,7 @@ async def _on_lookup_invoice(
     payment = await get_wallet_payment(nwc.wallet, payment_hash)
     if not payment:
         raise Exception("Payment not found")
-    invoice_data = bolt11_decode(payment.bolt11)
-    is_settled = not payment.pending
-    timestamp = int(payment.time.timestamp()) or int(invoice_data.date)
-    expiry = int(payment.expiry.timestamp()) if payment.expiry else timestamp + 3600
-    preimage = (
-        payment.preimage
-        or "0000000000000000000000000000000000000000000000000000000000000000"
-    )
-    res: dict = {
-        "type": "outgoing" if payment.is_out else "incoming",
-        "invoice": payment.bolt11,
-        "description": (
-            invoice_data.description if invoice_data.description else payment.memo
-        ),
-        "preimage": preimage if is_settled or payment.is_in else None,
-        "payment_hash": payment.payment_hash,
-        "amount": abs(payment.msat),
-        "fees_paid": abs(payment.fee),
-        "created_at": timestamp,
-        "expires_at": expiry,
-        "settled_at": timestamp if is_settled else None,
-        "metadata": {},
-    }
-    if invoice_data.description_hash:
-        res["description_hash"] = invoice_data.description_hash
+    res = _build_transaction_data(payment)
     # await log_nwc(pubkey, payload)
     return [(res, None, [])]
 
@@ -426,30 +587,8 @@ async def _on_list_transactions(
         offset=offset,
     )
     transactions: list[dict] = []
-    p: Payment
     for p in history:
-        invoice_data = bolt11_decode(p.bolt11)
-        is_settled = not p.pending
-        timestamp = int(p.time.timestamp()) or invoice_data.date
-        transactions.append(
-            {
-                "type": "outgoing" if p.is_out else "incoming",
-                "invoice": p.bolt11,
-                # Fallback chain so a human-readable description reaches
-                # the NWC client. Mirror of `_on_lookup_invoice`
-                "description": (
-                    (p.extra or {}).get("comment") or invoice_data.description or p.memo
-                ),
-                "description_hash": invoice_data.description_hash,
-                "preimage": p.preimage if is_settled or p.is_in else None,
-                "payment_hash": p.payment_hash,
-                "amount": abs(p.msat),
-                "fees_paid": p.fee,
-                "created_at": timestamp,
-                "settled_at": timestamp if is_settled else None,
-                "metadata": {},
-            }
-        )
+        transactions.append(_build_transaction_data(p))
         await asyncio.sleep(0)
     # await log_nwc(pubkey, payload)
     return [({"transactions": transactions}, None, [])]
@@ -503,6 +642,10 @@ async def _on_get_info(
             if spm in allowed_methods:
                 account_methods.append(spm)
                 break
+    # Include supported notifications if key has notifications permission
+    notifications = []
+    if "notifications" in permissions:
+        notifications = sp.supported_notifications
     # await log_nwc(pubkey, payload)
     return [
         (
@@ -513,11 +656,97 @@ async def _on_get_info(
                 "block_height": 0,
                 "block_hash": "",
                 "methods": account_methods,
+                "notifications": notifications,
             },
             None,
             [],
         )
     ]
+
+
+async def _on_invoice_paid(sp: NWCServiceProvider, payment: Payment):
+    """Handle an incoming payment by sending payment_received notifications."""
+    if not (payment.is_in and payment.success):
+        return
+    try:
+        notification = _build_transaction_data(payment)
+        await _send_notification_to_wallet(
+            sp, payment.wallet_id, "payment_received", notification
+        )
+    except Exception as e:
+        logger.debug(f"Failed to handle invoice paid notification: {e}")
+
+
+def _enqueue_notification(queue: asyncio.Queue, payment: Payment) -> None:
+    """Never blocks LNbits' dispatcher; drops (logged) when the backlog is full."""
+    try:
+        queue.put_nowait(payment)
+    except asyncio.QueueFull:
+        logger.warning(
+            "nwcprovider: notification backlog full, dropped payment_received "
+            f"for {payment.payment_hash}"
+        )
+
+
+async def _notification_worker(sp: NWCServiceProvider, queue: asyncio.Queue):
+    while True:
+        payment = await queue.get()
+        await _on_invoice_paid(sp, payment)
+
+
+async def _legacy_notification_forwarder(queue: asyncio.Queue):
+    """Older LNbits without task_manager: forward from its unbounded queue."""
+    lnbits_queue: asyncio.Queue = asyncio.Queue()
+    register_invoice_listener(lnbits_queue, "ext_nwcprovider")
+    try:
+        while True:
+            _enqueue_notification(queue, await lnbits_queue.get())
+    finally:
+        # Unregister, or LNbits keeps filling the abandoned queue after stop.
+        try:
+            import lnbits.tasks as lnbits_tasks
+
+            listeners = getattr(lnbits_tasks, "invoice_listeners", None)
+            if listeners and listeners.get("ext_nwcprovider") is lnbits_queue:
+                listeners.pop("ext_nwcprovider", None)
+        except Exception as e:
+            logger.debug(f"nwcprovider: unregistering legacy listener: {e}")
+
+
+def _start_notification_listener(sp: NWCServiceProvider) -> list[Any]:
+    """
+    Subscribe to incoming payments for payment_received notifications.
+    LNbits hands each payment to a callback that only enqueues it into our
+    bounded queue; an owned worker publishes, so a relay outage can neither
+    block LNbits nor grow memory without limit. Returns the handles that
+    _stop_notification_listener must remove.
+    """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=NOTIFICATION_QUEUE_MAXSIZE)
+    handles: list[Any] = [asyncio.create_task(_notification_worker(sp, queue))]
+    if task_manager is None:
+        handles.append(asyncio.create_task(_legacy_notification_forwarder(queue)))
+        return handles
+
+    async def on_paid(payment: Payment) -> None:
+        _enqueue_notification(queue, payment)
+
+    handles.append(
+        task_manager.register_invoice_listener(
+            on_paid, name="ext_nwcprovider_notifications"
+        )
+    )
+    return handles
+
+
+def _stop_notification_listener(handles: list[Any]) -> None:
+    for handle in handles:
+        try:
+            if isinstance(handle, asyncio.Task):
+                handle.cancel()
+            elif task_manager is not None:
+                task_manager.cancel_task(handle)
+        except Exception as e:  # already removed / shutting down
+            logger.debug(f"nwcprovider: stopping notification listener: {e}")
 
 
 async def handle_nwc():
@@ -537,12 +766,17 @@ async def handle_nwc():
     # nwcsp.addRequestListener("multi_pay_keysend", _on_multi_pay_keysend)
     ###
     await nwcsp.start()
+    listener = _start_notification_listener(nwcsp)
     try:
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:
         await nwcsp.cleanup()
         raise
+    finally:
+        # Always unsubscribe, also if this task dies and is restarted, so we
+        # never leave an orphaned listener (or a duplicate one) behind.
+        _stop_notification_listener(listener)
 
 
 async def handle_execution_queue():

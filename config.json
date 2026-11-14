@@ -1,11 +1,11 @@
 {
   "id": "nwcprovider",
-  "name": "NWC Service Provider",
-  "repo": "https://github.com/lnbits/nwcprovider",
+  "name": "NWC Service Provider (BP)",
+  "repo": "https://github.com/BenGWeeks/nwcprovider",
   "short_description": "A NWC service provider for LNbits",
   "description": "",
   "tile": "/nwcprovider/static/image/nwcprovider.png",
-  "version": "1.2.1",
+  "version": "1.2.1+bp1",
   "min_lnbits_version": "1.7.0",
   "contributors": [
     {
