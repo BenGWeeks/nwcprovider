@@ -63,7 +63,7 @@ class NWCNewBudget(BaseModel):
     @field_validator("budget_msats", "refresh_window", "created_at", mode="before")
     @classmethod
     def _truncate_floats(cls, value: object) -> object:
-        # Pydantic 1 truncated fractional numbers here (e.g. 1.1 sats * 1000 from the UI); keep accepting them
+        # Pydantic 1 truncated floats here (UI sends 1.1 sats * 1000)
         if isinstance(value, float) and math.isfinite(value):
             return int(value)
         return value
