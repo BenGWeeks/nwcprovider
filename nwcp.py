@@ -13,6 +13,16 @@ from loguru import logger
 from pynostr.key import PrivateKey
 from websockets.legacy.client import connect
 
+# Re-send the subscriptions periodically: a relay (or the nostrclient proxy)
+# can lose them without closing the connection or sending CLOSED.
+RESUBSCRIBE_INTERVAL_SECONDS = 5 * 60
+WATCHDOG_INTERVAL_SECONDS = 15
+# The info event is re-sent every 60s and acknowledged with OK, so a relay that
+# stays silent for longer than this is no longer talking to us.
+WATCHDOG_SILENCE_SECONDS = 3 * 60
+# Requests are held back until EOSE; do not hold them forever if it never comes.
+EOSE_TIMEOUT_SECONDS = 30
+
 
 class RateLimit:
     backoff: int = 0
@@ -23,6 +33,8 @@ class MainSubscription:
     def __init__(self):
         self.requests_sub_id: str | None = None
         self.responses_sub_id: str | None = None
+        # requests subscription replaced by this one (events may still be in flight)
+        self.previous_requests_sub_id: str | None = None
         self.requests_eose = False
         self.responses_eose = False
         self.events: dict[str, dict] = {}
@@ -137,6 +149,13 @@ class NWCServiceProvider:
         # Periodic info event resend loop
         self.info_event_task = None
 
+        # Subscription refresh and connection watchdog loop
+        self.watchdog_task = None
+        self.last_message_time: float = 0
+        self.last_subscribe_time: float = 0
+        # True once the relay acknowledged an event with OK on this connection
+        self.relay_sends_ok = False
+
         # Requests are handled independently from the relay receive loop.
         self.request_tasks: set[asyncio.Task[list[dict]]] = set()
 
@@ -207,6 +226,7 @@ class NWCServiceProvider:
         self.reconnect_task = asyncio.create_task(self._connect_to_relay())
         self.gc_task = asyncio.create_task(self._gc_loop())
         self.info_event_task = asyncio.create_task(self._info_event_loop())
+        self.watchdog_task = asyncio.create_task(self._watchdog_loop())
 
     def _json_dumps(self, data: Union[dict, list]) -> str:
         """
@@ -290,14 +310,31 @@ class NWCServiceProvider:
 
     def _create_subscription(self) -> MainSubscription:
         sub = MainSubscription()
+        if self.sub:
+            # keep the replay protection across resubscriptions
+            sub.seen_requests = self.sub.seen_requests
         self.sub = sub
         return sub
 
-    async def _subscribe(self):
+    async def _subscribe(self, replace: bool = False):
         """
         [Re]Subscribe to receive nip 47 requests and responses from the relay
+
+        Args:
+            replace (bool): the previous subscriptions are still open on this
+                connection: take over from them and close them.
         """
+        previous = self.sub if replace else None
         sub = self._create_subscription()
+        if previous:
+            sub.previous_requests_sub_id = previous.requests_sub_id
+            # requests already known must not wait for a new EOSE
+            sub.requests_eose = previous.requests_eose
+            sub.responses_eose = previous.responses_eose
+            oldest = int(time.time()) - self.event_max_age
+            for event in previous.get_stale():
+                if event["created_at"] >= oldest:
+                    sub.events[event["id"]] = event
         # Create requests subscription
         req_filter = {
             "kinds": [23194],
@@ -314,8 +351,62 @@ class NWCServiceProvider:
         }
         sub.responses_sub_id = self._get_new_subid()
         # Subscribe
+        self.last_subscribe_time = time.monotonic()
         await self._send(["REQ", sub.requests_sub_id, req_filter])
         await self._send(["REQ", sub.responses_sub_id, res_filter])
+        if previous:
+            for sub_id in (previous.requests_sub_id, previous.responses_sub_id):
+                if sub_id:
+                    await self._send(["CLOSE", sub_id])
+
+    def _dispatch_stale_requests(self) -> None:
+        if not self.sub:
+            return
+        for stale in self.sub.get_stale():
+            if stale["id"] not in self.sub.seen_requests:
+                self._dispatch_request(stale)
+
+    async def _watchdog_loop(self):
+        """
+        Periodically refresh the subscriptions and reconnect if the relay
+        went quiet, so a silently dropped subscription or a dead connection
+        cannot leave the provider deaf until the next restart.
+        """
+        while not self._is_shutting_down():
+            await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+            try:
+                await self._watchdog_check()
+            except Exception as e:
+                logger.warning("NWC watchdog error: " + str(e))
+
+    async def _watchdog_check(self):
+        if not self.connected or not self.ws or self._is_shutting_down():
+            return
+        now = time.monotonic()
+        silence = now - self.last_message_time
+        if self.relay_sends_ok and silence > WATCHDOG_SILENCE_SECONDS:
+            logger.warning(
+                "No message from NWC relay for "
+                + str(int(silence))
+                + " seconds, reconnecting..."
+            )
+            self.last_message_time = now
+            await self.ws.close()
+            return
+        if now - self.last_subscribe_time > RESUBSCRIBE_INTERVAL_SECONDS:
+            logger.info("Refreshing NWC subscriptions")
+            await self._subscribe(replace=True)
+            return
+        sub = self.sub
+        if (
+            sub
+            and not (sub.requests_eose and sub.responses_eose)
+            and now - self.last_subscribe_time > EOSE_TIMEOUT_SECONDS
+        ):
+            logger.warning("No EOSE from NWC relay, handling requests anyway")
+            sub.requests_eose = True
+            sub.responses_eose = True
+            self._dispatch_stale_requests()
 
     async def _on_connection(self, _):
         """
@@ -507,7 +598,14 @@ class NWCServiceProvider:
         if expiration > 0 and expiration < int(time.time()):
             logger.debug("Event expired")
             return
-        if event["kind"] == 23194 and sub_id == self.sub.requests_sub_id:
+        if event["kind"] == 23194 and sub_id in (
+            self.sub.requests_sub_id,
+            self.sub.previous_requests_sub_id,
+        ):
+            # Already tracked or handled (e.g. delivered by both the current
+            # and the replaced subscription)
+            if event["id"] in self.sub.events or event["id"] in self.sub.seen_requests:
+                return
             # Ensure the request is for this service provider
             valid_p = any(
                 tag[0] == "p" and tag[1] == self.public_key_hex for tag in tags
@@ -547,9 +645,7 @@ class NWCServiceProvider:
         #         service connection and do not have a response yet,
         #         are considered stale, we will process them now
         if self.sub.requests_eose and self.sub.responses_eose:
-            stales = self.sub.get_stale()
-            for stale in stales:
-                self._dispatch_request(stale)
+            self._dispatch_stale_requests()
 
     async def _on_closed_message(self, msg):
         if not self.sub:
@@ -567,7 +663,7 @@ class NWCServiceProvider:
                 + " ... resubscribing..."
             )
             await self._ratelimit("subscribing")
-            await self._subscribe()
+            await self._subscribe(replace=True)
 
     async def _on_message(self, _, message: str):
         """
@@ -585,7 +681,7 @@ class NWCServiceProvider:
                 # A message from the relay, mostly useless, but we log it anyway
                 logger.info("Notice from relay " + self.relay + ": " + str(msg[1]))
             elif msg[0] == "OK":
-                pass
+                self.relay_sends_ok = True
             else:
                 raise Exception("Unknown message type " + str(msg[0]))
         except Exception as e:
@@ -605,19 +701,24 @@ class NWCServiceProvider:
                 async with connect(self.relay) as ws:
                     self.ws = ws
                     self.connected = True
+                    self.relay_sends_ok = False
+                    self.last_message_time = time.monotonic()
+                    self.last_subscribe_time = self.last_message_time
+                    logger.info("Connected to NWC relay " + self.relay)
                     await self._on_connection(ws)
                     while (
                         not self._is_shutting_down()
                     ):  # receive messages until the instance is shutting down
                         try:
                             reply = await ws.recv()
+                            self.last_message_time = time.monotonic()
                             if isinstance(reply, bytes):
                                 reply = reply.decode("utf-8")
                             await self._on_message(ws, reply)
                         except Exception as e:
-                            logger.debug("Error receiving message: " + str(e))
+                            logger.warning("Error receiving message: " + str(e))
                             break
-                logger.debug("Connection to NWC relay closed")
+                logger.warning("Connection to NWC relay closed")
             except Exception as e:
                 logger.error("Error connecting to NWC relay: " + str(e))
                 await asyncio.sleep(5)
@@ -692,21 +793,17 @@ class NWCServiceProvider:
         logger.debug("Closing NWC Service Provider connection")
         self.shutdown = True  # Mark for shutdown
         # close tasks
-        try:
-            if self.reconnect_task:
-                self.reconnect_task.cancel()
-        except Exception as e:
-            logger.warning("Error closing reconnection task: " + str(e))
-        try:
-            if self.gc_task:
-                self.gc_task.cancel()
-        except Exception as e:
-            logger.warning("Error closing gc loop: " + str(e))
-        try:
-            if self.info_event_task:
-                self.info_event_task.cancel()
-        except Exception as e:
-            logger.warning("Error closing info event loop: " + str(e))
+        for name, task in (
+            ("reconnection task", self.reconnect_task),
+            ("gc loop", self.gc_task),
+            ("info event loop", self.info_event_task),
+            ("watchdog loop", self.watchdog_task),
+        ):
+            try:
+                if task:
+                    task.cancel()
+            except Exception as e:
+                logger.warning("Error closing " + name + ": " + str(e))
         request_tasks = list(self.request_tasks)
         for task in request_tasks:
             task.cancel()
