@@ -7,6 +7,7 @@ import time
 import pytest
 from loguru import logger
 
+from ... import nwcp
 from ...nwcp import NWCServiceProvider
 
 
@@ -388,3 +389,299 @@ def test_supported_notifications(nwc_service_provider):
     """Test that supported_notifications is set correctly."""
     assert "payment_received" in nwc_service_provider.supported_notifications
     assert "payment_sent" in nwc_service_provider.supported_notifications
+
+
+class _FakeWebSocket:
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+def _connected_provider(provider, monkeypatch):
+    """A provider that believes it is connected; returns what it sends."""
+    sent: list[list] = []
+
+    async def _send_capture(obj):
+        sent.append(obj)
+
+    provider._send = _send_capture
+    provider.connected = True
+    provider.ws = _FakeWebSocket()
+    provider.last_message_time = time.monotonic()
+    provider.last_subscribe_time = time.monotonic()
+    monkeypatch.setattr(provider, "_verify_event", lambda event: True)
+    return sent
+
+
+def _request(provider, sub_id, event_id="request"):
+    return json.dumps(
+        [
+            "EVENT",
+            sub_id,
+            {
+                "id": event_id,
+                "kind": 23194,
+                "pubkey": "a" * 64,
+                "content": "",
+                "tags": [["p", provider.public_key_hex]],
+                "created_at": int(time.time()),
+            },
+        ]
+    )
+
+
+def _record_handled(provider, monkeypatch):
+    handled: list[str] = []
+
+    async def _handle_request(event):
+        handled.append(event["id"])
+        return []
+
+    monkeypatch.setattr(provider, "_handle_request", _handle_request)
+    return handled
+
+
+async def _drain(provider):
+    await asyncio.gather(*list(provider.request_tasks))
+
+
+@pytest.mark.asyncio
+async def test_watchdog_refreshes_subscriptions_periodically(
+    nwc_service_provider, monkeypatch
+):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    first = nwc_service_provider.sub
+    first.requests_eose = first.responses_eose = True
+    first.seen_requests["handled"] = int(time.time()) + 60
+    sent.clear()
+
+    # nothing to do while the subscriptions are fresh
+    await nwc_service_provider._watchdog_check()
+    assert sent == []
+
+    nwc_service_provider.last_subscribe_time -= nwcp.RESUBSCRIBE_INTERVAL_SECONDS + 1
+    await nwc_service_provider._watchdog_check()
+
+    second = nwc_service_provider.sub
+    assert second is not first
+    assert [m[:2] for m in sent] == [
+        ["REQ", second.requests_sub_id],
+        ["REQ", second.responses_sub_id],
+        ["CLOSE", first.requests_sub_id],
+        ["CLOSE", first.responses_sub_id],
+    ]
+    assert sent[0][2]["kinds"] == [23194]
+    assert sent[0][2]["#p"] == [nwc_service_provider.public_key_hex]
+    # requests are handled right away, without waiting for a new EOSE
+    assert second.requests_eose and second.responses_eose
+    # replay protection survives the refresh
+    assert "handled" in second.seen_requests
+
+
+@pytest.mark.asyncio
+async def test_request_on_replaced_subscription_is_handled_once(
+    nwc_service_provider, monkeypatch
+):
+    _connected_provider(nwc_service_provider, monkeypatch)
+    handled = _record_handled(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    first = nwc_service_provider.sub
+    first.requests_eose = first.responses_eose = True
+    await nwc_service_provider._subscribe()
+    second = nwc_service_provider.sub
+
+    # still in flight on the old subscription, then delivered on the new one
+    for sub_id in (first.requests_sub_id, second.requests_sub_id):
+        await nwc_service_provider._on_message(
+            None, _request(nwc_service_provider, sub_id)
+        )
+    await nwc_service_provider._on_message(
+        None, _request(nwc_service_provider, "unknown-sub", "other")
+    )
+    await _drain(nwc_service_provider)
+    assert handled == ["request"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_requests_waiting_for_eose(
+    nwc_service_provider, monkeypatch
+):
+    _connected_provider(nwc_service_provider, monkeypatch)
+    handled = _record_handled(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    first = nwc_service_provider.sub
+    await nwc_service_provider._on_message(
+        None, _request(nwc_service_provider, first.requests_sub_id)
+    )
+    assert handled == []  # no EOSE yet
+
+    await nwc_service_provider._subscribe()
+    second = nwc_service_provider.sub
+    for sub_id in (second.requests_sub_id, second.responses_sub_id):
+        await nwc_service_provider._on_message(None, json.dumps(["EOSE", sub_id]))
+    await _drain(nwc_service_provider)
+    assert handled == ["request"]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_handles_requests_when_eose_never_arrives(
+    nwc_service_provider, monkeypatch
+):
+    _connected_provider(nwc_service_provider, monkeypatch)
+    handled = _record_handled(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    sub = nwc_service_provider.sub
+    await nwc_service_provider._on_message(
+        None, _request(nwc_service_provider, sub.requests_sub_id)
+    )
+    await nwc_service_provider._watchdog_check()
+    assert handled == []
+
+    nwc_service_provider.last_subscribe_time -= nwcp.EOSE_TIMEOUT_SECONDS + 1
+    await nwc_service_provider._watchdog_check()
+    await _drain(nwc_service_provider)
+    assert handled == ["request"]
+    assert nwc_service_provider.sub is sub
+    assert sub.requests_eose and sub.responses_eose
+
+
+@pytest.mark.asyncio
+async def test_watchdog_reconnects_when_relay_goes_quiet(
+    nwc_service_provider, monkeypatch
+):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+    ws = nwc_service_provider.ws
+    quiet = nwcp.WATCHDOG_SILENCE_SECONDS + 1
+
+    # a relay that never acknowledged with OK is not expected to talk
+    nwc_service_provider.last_message_time -= quiet
+    await nwc_service_provider._watchdog_check()
+    assert not ws.closed
+
+    await nwc_service_provider._on_message(None, json.dumps(["OK", "id", True, ""]))
+    assert nwc_service_provider.relay_sends_ok
+    await nwc_service_provider._watchdog_check()
+    assert ws.closed
+    assert sent == []
+
+    # closing drops the connection; the receive loop reconnects
+    ws.closed = False
+    await nwc_service_provider._watchdog_check()
+    assert not ws.closed
+
+
+@pytest.mark.asyncio
+async def test_watchdog_is_idle_while_disconnected(nwc_service_provider, monkeypatch):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+    nwc_service_provider.connected = False
+    nwc_service_provider.relay_sends_ok = True
+    nwc_service_provider.last_message_time = 0
+    nwc_service_provider.last_subscribe_time = 0
+    await nwc_service_provider._watchdog_check()
+    assert sent == []
+    assert not nwc_service_provider.ws.closed
+
+
+@pytest.mark.asyncio
+async def test_closed_subscription_is_replaced(nwc_service_provider, monkeypatch):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+
+    async def _no_wait(unit):
+        pass
+
+    monkeypatch.setattr(nwc_service_provider, "_ratelimit", _no_wait)
+    await nwc_service_provider._subscribe()
+    first = nwc_service_provider.sub
+    sent.clear()
+    await nwc_service_provider._on_message(
+        None, json.dumps(["CLOSED", first.requests_sub_id, "rate-limited"])
+    )
+    second = nwc_service_provider.sub
+    assert second is not first
+    assert ["CLOSE", first.responses_sub_id] in sent
+    assert ["REQ", second.requests_sub_id] in [m[:2] for m in sent]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cancels_watchdog(nwc_service_provider):
+    await nwc_service_provider.start()
+    watchdog_task = nwc_service_provider.watchdog_task
+    assert watchdog_task is not None
+    await nwc_service_provider.cleanup()
+    await asyncio.sleep(0)
+    assert watchdog_task.cancelled() or watchdog_task.done()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_resubscriptions_leave_no_orphan(
+    nwc_service_provider, monkeypatch
+):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    slow_task: list[asyncio.Task] = []
+
+    async def _send(obj):
+        # the first task is slow on the wire, the second one is not
+        if asyncio.current_task() in slow_task:
+            await asyncio.sleep(0.01)
+        sent.append(obj)
+
+    nwc_service_provider._send = _send
+
+    # the watchdog and the CLOSED handler at the same time
+    slow_task.append(asyncio.create_task(nwc_service_provider._subscribe()))
+    await asyncio.sleep(0)
+    await nwc_service_provider._subscribe()
+    await slow_task[0]
+
+    # what the relay ends up with, applying the frames in the order sent
+    open_on_relay: set[str] = set()
+    for message in sent:
+        if message[0] == "REQ":
+            open_on_relay.add(message[1])
+        elif message[0] == "CLOSE":
+            open_on_relay.discard(message[1])
+    sub = nwc_service_provider.sub
+    assert open_on_relay == {sub.requests_sub_id, sub.responses_sub_id}
+
+
+@pytest.mark.asyncio
+async def test_subscriptions_of_a_previous_connection_are_not_taken_over(
+    nwc_service_provider, monkeypatch
+):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    first = nwc_service_provider.sub
+    first.requests_eose = first.responses_eose = True
+    first.seen_requests["handled"] = int(time.time()) + 60
+    sent.clear()
+
+    nwc_service_provider.ws = _FakeWebSocket()  # reconnected
+    await nwc_service_provider._subscribe()
+    second = nwc_service_provider.sub
+    assert [m[0] for m in sent] == ["REQ", "REQ"]
+    # a new connection waits for EOSE again, but keeps the replay protection
+    assert not (second.requests_eose or second.responses_eose)
+    assert second.previous_requests_sub_id is None
+    assert "handled" in second.seen_requests
+
+
+@pytest.mark.asyncio
+async def test_closed_for_already_replaced_subscription_is_ignored(
+    nwc_service_provider, monkeypatch
+):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    first = nwc_service_provider.sub
+
+    async def _replaced_meanwhile(unit):
+        await nwc_service_provider._subscribe()
+
+    monkeypatch.setattr(nwc_service_provider, "_ratelimit", _replaced_meanwhile)
+    await nwc_service_provider._on_message(
+        None, json.dumps(["CLOSED", first.requests_sub_id, "rate-limited"])
+    )
+    assert len([m for m in sent if m[0] == "REQ"]) == 4
