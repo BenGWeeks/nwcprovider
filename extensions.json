@@ -25,6 +25,18 @@
       "details_link": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/black-panther/config.json",
       "archive": "https://github.com/BenGWeeks/nwcprovider/archive/refs/tags/v1.2.1+bp1.zip",
       "hash": "218d0f26a11f5190646abb7e23925493361343cb75b9cde23deb6f340f25d36e"
+    },
+    {
+      "id": "nwcprovider",
+      "repo": "https://github.com/BenGWeeks/nwcprovider",
+      "name": "NWC Service Provider (BP)",
+      "version": "1.2.1+bp2",
+      "min_lnbits_version": "1.7.0",
+      "short_description": "black-panther build on upstream v1.2.1 for LNbits 1.7: periodic resubscribe + quiet-relay watchdog, EOSE timeout, plus bp1 changes.",
+      "icon": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/black-panther/static/image/nwcprovider.png",
+      "details_link": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/black-panther/config.json",
+      "archive": "https://github.com/BenGWeeks/nwcprovider/archive/refs/tags/v1.2.1+bp2.zip",
+      "hash": "f9f22752fdae07af8de7d852d406c8c62aa622d1e45a6899dc9b70ae2b1b3886"
     }
   ]
 }
