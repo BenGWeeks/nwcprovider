@@ -490,7 +490,7 @@ async def test_request_on_replaced_subscription_is_handled_once(
     await nwc_service_provider._subscribe()
     first = nwc_service_provider.sub
     first.requests_eose = first.responses_eose = True
-    await nwc_service_provider._subscribe(replace=True)
+    await nwc_service_provider._subscribe()
     second = nwc_service_provider.sub
 
     # still in flight on the old subscription, then delivered on the new one
@@ -518,7 +518,7 @@ async def test_refresh_keeps_requests_waiting_for_eose(
     )
     assert handled == []  # no EOSE yet
 
-    await nwc_service_provider._subscribe(replace=True)
+    await nwc_service_provider._subscribe()
     second = nwc_service_provider.sub
     for sub_id in (second.requests_sub_id, second.responses_sub_id):
         await nwc_service_provider._on_message(None, json.dumps(["EOSE", sub_id]))
@@ -613,3 +613,75 @@ async def test_cleanup_cancels_watchdog(nwc_service_provider):
     await nwc_service_provider.cleanup()
     await asyncio.sleep(0)
     assert watchdog_task.cancelled() or watchdog_task.done()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_resubscriptions_leave_no_orphan(
+    nwc_service_provider, monkeypatch
+):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    slow_task: list[asyncio.Task] = []
+
+    async def _send(obj):
+        # the first task is slow on the wire, the second one is not
+        if asyncio.current_task() in slow_task:
+            await asyncio.sleep(0.01)
+        sent.append(obj)
+
+    nwc_service_provider._send = _send
+
+    # the watchdog and the CLOSED handler at the same time
+    slow_task.append(asyncio.create_task(nwc_service_provider._subscribe()))
+    await asyncio.sleep(0)
+    await nwc_service_provider._subscribe()
+    await slow_task[0]
+
+    # what the relay ends up with, applying the frames in the order sent
+    open_on_relay: set[str] = set()
+    for message in sent:
+        if message[0] == "REQ":
+            open_on_relay.add(message[1])
+        elif message[0] == "CLOSE":
+            open_on_relay.discard(message[1])
+    sub = nwc_service_provider.sub
+    assert open_on_relay == {sub.requests_sub_id, sub.responses_sub_id}
+
+
+@pytest.mark.asyncio
+async def test_subscriptions_of_a_previous_connection_are_not_taken_over(
+    nwc_service_provider, monkeypatch
+):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    first = nwc_service_provider.sub
+    first.requests_eose = first.responses_eose = True
+    first.seen_requests["handled"] = int(time.time()) + 60
+    sent.clear()
+
+    nwc_service_provider.ws = _FakeWebSocket()  # reconnected
+    await nwc_service_provider._subscribe()
+    second = nwc_service_provider.sub
+    assert [m[0] for m in sent] == ["REQ", "REQ"]
+    # a new connection waits for EOSE again, but keeps the replay protection
+    assert not (second.requests_eose or second.responses_eose)
+    assert second.previous_requests_sub_id is None
+    assert "handled" in second.seen_requests
+
+
+@pytest.mark.asyncio
+async def test_closed_for_already_replaced_subscription_is_ignored(
+    nwc_service_provider, monkeypatch
+):
+    sent = _connected_provider(nwc_service_provider, monkeypatch)
+    await nwc_service_provider._subscribe()
+    first = nwc_service_provider.sub
+
+    async def _replaced_meanwhile(unit):
+        await nwc_service_provider._subscribe()
+
+    monkeypatch.setattr(nwc_service_provider, "_ratelimit", _replaced_meanwhile)
+    await nwc_service_provider._on_message(
+        None, json.dumps(["CLOSED", first.requests_sub_id, "rate-limited"])
+    )
+    assert len([m for m in sent if m[0] == "REQ"]) == 4

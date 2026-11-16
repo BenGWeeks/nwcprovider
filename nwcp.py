@@ -35,6 +35,8 @@ class MainSubscription:
         self.responses_sub_id: str | None = None
         # requests subscription replaced by this one (events may still be in flight)
         self.previous_requests_sub_id: str | None = None
+        # connection the subscriptions were sent on
+        self.ws: Any = None
         self.requests_eose = False
         self.responses_eose = False
         self.events: dict[str, dict] = {}
@@ -155,6 +157,8 @@ class NWCServiceProvider:
         self.last_subscribe_time: float = 0
         # True once the relay acknowledged an event with OK on this connection
         self.relay_sends_ok = False
+        # Only one task at a time may replace the subscriptions
+        self.subscribe_lock = asyncio.Lock()
 
         # Requests are handled independently from the relay receive loop.
         self.request_tasks: set[asyncio.Task[list[dict]]] = set()
@@ -316,16 +320,21 @@ class NWCServiceProvider:
         self.sub = sub
         return sub
 
-    async def _subscribe(self, replace: bool = False):
+    async def _subscribe(self):
         """
-        [Re]Subscribe to receive nip 47 requests and responses from the relay
+        [Re]Subscribe to receive nip 47 requests and responses from the relay.
+        Subscriptions already open on this connection are taken over and closed.
+        """
+        # The watchdog and the CLOSED handler can get here at the same time:
+        # unserialised, both would replace the same subscription and the one
+        # that loses would stay open on the relay forever.
+        async with self.subscribe_lock:
+            await self._replace_subscriptions()
 
-        Args:
-            replace (bool): the previous subscriptions are still open on this
-                connection: take over from them and close them.
-        """
-        previous = self.sub if replace else None
+    async def _replace_subscriptions(self):
+        previous = self.sub if self.sub and self.sub.ws is self.ws else None
         sub = self._create_subscription()
+        sub.ws = self.ws
         if previous:
             sub.previous_requests_sub_id = previous.requests_sub_id
             # requests already known must not wait for a new EOSE
@@ -395,7 +404,7 @@ class NWCServiceProvider:
             return
         if now - self.last_subscribe_time > RESUBSCRIBE_INTERVAL_SECONDS:
             logger.info("Refreshing NWC subscriptions")
-            await self._subscribe(replace=True)
+            await self._subscribe()
             return
         sub = self.sub
         if (
@@ -663,7 +672,13 @@ class NWCServiceProvider:
                 + " ... resubscribing..."
             )
             await self._ratelimit("subscribing")
-            await self._subscribe(replace=True)
+            # replaced in the meantime (watchdog, or CLOSED for the other one)
+            if self.sub and sub_id not in (
+                self.sub.requests_sub_id,
+                self.sub.responses_sub_id,
+            ):
+                return
+            await self._subscribe()
 
     async def _on_message(self, _, message: str):
         """
