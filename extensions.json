@@ -37,6 +37,18 @@
       "details_link": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/black-panther/config.json",
       "archive": "https://github.com/BenGWeeks/nwcprovider/archive/refs/tags/v1.2.1+bp2.zip",
       "hash": "f9f22752fdae07af8de7d852d406c8c62aa622d1e45a6899dc9b70ae2b1b3886"
+    },
+    {
+      "id": "nwcprovider",
+      "repo": "https://github.com/BenGWeeks/nwcprovider",
+      "name": "NWC Service Provider (BP)",
+      "version": "1.2.2+bp3",
+      "min_lnbits_version": "1.7.0",
+      "short_description": "black-panther build on upstream v1.2.2 for LNbits 1.7: upstream security fix (#61, re-check connection before paying) and state field (#50), plus bp2 watchdog and bp1 changes.",
+      "icon": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/black-panther/static/image/nwcprovider.png",
+      "details_link": "https://raw.githubusercontent.com/BenGWeeks/nwcprovider/black-panther/config.json",
+      "archive": "https://github.com/BenGWeeks/nwcprovider/archive/refs/tags/v1.2.2+bp3.zip",
+      "hash": "7ef0fd04fbceec127617a2a22e8e54cc4aa29313b1309ab4eafcac9501b48af9"
     }
   ]
 }
