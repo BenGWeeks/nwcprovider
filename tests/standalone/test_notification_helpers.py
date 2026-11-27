@@ -335,8 +335,8 @@ def test_build_transaction_data_pending():
     assert result["type"] == "outgoing"
     assert result["state"] == "pending"
     assert result["amount"] == 3000
-    assert result["preimage"] is None, "Pending outgoing should have no preimage"
-    assert result["settled_at"] is None
+    assert "preimage" not in result, "Pending outgoing should have no preimage"
+    assert "settled_at" not in result
     print("  PASS: _build_transaction_data pending outgoing")
 
 
