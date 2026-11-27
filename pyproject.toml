@@ -1,6 +1,6 @@
 [project]
 name = "nwcprovider"
-version = "1.2.1+bp2"
+version = "1.2.2+bp3"
 description = "A NWC service provider for LNbits."
 requires-python = ">=3.10,<3.14"
 authors = [{ name = "Riccardo Balbo", email = "oc@rblb.it" }]

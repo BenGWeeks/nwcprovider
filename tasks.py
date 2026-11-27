@@ -78,33 +78,39 @@ async def _check(nwc: NWCKey | None, method: str) -> dict | None:
     return None
 
 
+def _nip47_state(payment: Payment) -> str:
+    """Map an LNbits payment to a NIP-47/NWC payment state.
+
+    LNbits only tracks pending/success/failed, while NWC separates an expired
+    incoming invoice from a failed outgoing payment. `not payment.pending` is
+    true for a failed payment too, so it cannot be used as "settled".
+    An incoming payment that failed without expiring (a canceled hold invoice,
+    for example) is reported as `failed`: NIP-47 defines no `canceled` state
+    for invoices.
+    """
+    if payment.success:
+        return "settled"
+    if payment.failed:
+        if not payment.is_in:
+            return "failed"
+        return "expired" if payment.is_expired else "failed"
+    # black-panther: LNbits can leave an unpaid incoming invoice pending after
+    # its expiry; NIP-47 calls that expired. An outgoing payment stays pending
+    # (its HTLC may still be in flight) whatever the invoice expiry says.
+    if payment.is_in and payment.is_expired:
+        return "expired"
+    return "pending"
+
+
 def _build_transaction_data(payment: Payment) -> dict:
     """
     Build the NIP-47 transaction data dict from a Payment object.
     Used for lookup_invoice, list_transactions, and notification payloads.
     """
     invoice_data = bolt11_decode(payment.bolt11)
-    # Only a successful payment is settled; LNbits also marks failed (and
-    # expired incoming) payments as not pending.
-    is_settled = payment.success
+    state = _nip47_state(payment)
     timestamp = int(payment.time.timestamp()) or int(invoice_data.date)
     expiry = int(payment.expiry.timestamp()) if payment.expiry else timestamp + 3600
-    preimage = (
-        payment.preimage
-        or "0000000000000000000000000000000000000000000000000000000000000000"
-    )
-    # Derive NIP-47 state from Payment status
-    if payment.success:
-        state = "settled"
-    elif payment.is_in and payment.is_expired:
-        # LNbits marks unpaid expired invoices as failed; NIP-47 says expired.
-        state = "expired"
-    elif payment.failed:
-        state = "failed"
-    elif payment.is_expired:
-        state = "expired"
-    else:
-        state = "pending"
     res: dict = {
         "type": "outgoing" if payment.is_out else "incoming",
         "state": state,
@@ -115,15 +121,20 @@ def _build_transaction_data(payment: Payment) -> dict:
             or invoice_data.description
             or payment.memo
         ),
-        "preimage": preimage if is_settled or payment.is_in else None,
         "payment_hash": payment.payment_hash,
         "amount": abs(payment.msat),
         "fees_paid": abs(payment.fee),
         "created_at": timestamp,
         "expires_at": expiry,
-        "settled_at": timestamp if is_settled else None,
         "metadata": {},
     }
+    # A settlement time belongs only to a settled payment, and NWC does not
+    # allow returning a preimage that does not hash to `payment_hash` (the
+    # zero-filled placeholder used before did not).
+    if state == "settled":
+        res["settled_at"] = timestamp
+        if payment.preimage:
+            res["preimage"] = payment.preimage
     if invoice_data.description_hash:
         res["description_hash"] = invoice_data.description_hash
     return res
